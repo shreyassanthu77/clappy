@@ -1,15 +1,16 @@
 const std = @import("std");
 const clappy = @import("clappy");
 
+pub const clappy_options: clappy.Options = .{ .color = .auto };
+pub const std_options: std.Options = .{ .logFn = clappy.fmt.logFn };
+
 pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
+    try clappy.fmt.init(init);
 
-    var args = try init.minimal.args.iterateAllocator(gpa);
-    defer args.deinit();
+    try clappy.fmt.stderr("{%red,bold}error:{%} could not open {%#ff8700,i}{s}{%}\n", .{"config.zon"});
+    try clappy.fmt.stdout("hello {%green,bold}this is bold and green, {%u}underlined too{%}!\n", .{});
+    try clappy.fmt.stdout("usage: clappy-example {%dim}[options] <path>{%}\n", .{});
 
-    const s = clappy.fmt.Style{
-        .color = .green,
-        .bold = true,
-    };
-    std.log.info("Hello {f}this is bold and green!", .{s});
+    std.log.info("loaded {%b}{d}{%} plugins", .{3});
+    std.log.scoped(.net).warn("retrying {%yellow}{s}{%}", .{"example.com"});
 }

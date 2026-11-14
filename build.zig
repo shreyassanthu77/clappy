@@ -30,4 +30,8 @@ pub fn build(b: *std.Build) void {
 
     const check_step = b.step("check", "Check if the app compiles");
     check_step.dependOn(&exe.step);
+
+    const test_step = b.step("test", "Run tests");
+    const tests = b.addTest(.{ .root_module = clappy });
+    test_step.dependOn(&b.addRunArtifact(tests).step);
 }
