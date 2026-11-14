@@ -1,0 +1,7 @@
+.{
+    .name = .clappy,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.17.0",
+    .paths = .{""},
+    .fingerprint = 0xb2ed0e4388b48380,
+}
