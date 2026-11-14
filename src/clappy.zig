@@ -2,6 +2,9 @@ const std = @import("std");
 const root = @import("root");
 
 pub const fmt = @import("clappy/fmt.zig");
+pub const cmd = @import("clappy/cmd.zig");
+
+pub const parse = cmd.parse;
 
 /// Set by declaring `pub const clappy_options: clappy.Options = .{ ... };` in
 /// the root source file.
