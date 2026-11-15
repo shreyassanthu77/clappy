@@ -67,10 +67,9 @@ pub fn parse(comptime T: type, init: std.process.Init, options: Options) !T {
             std.process.exit(0);
         },
         error.ParseFailed => {
-            try clappy.fmt.stderr(
-                "{%red,bold}error:{%} {s}\n{%dim}run '{s} --help' for usage{%}\n",
-                .{ diag.message, diag.command },
-            );
+            try clappy.fmt.stderr("{%red,bold}error:{%} {s}\n", .{diag.message});
+            if (diag.suggestion) |s| try clappy.fmt.stderr("did you mean {%green}{s}{%}?\n", .{s});
+            try clappy.fmt.stderr("{%dim}run '{s} --help' for usage{%}\n", .{diag.command});
             std.process.exit(2);
         },
         error.OutOfMemory => return error.OutOfMemory,
@@ -81,6 +80,8 @@ pub const Error = error{ ParseFailed, HelpRequested, VersionRequested, OutOfMemo
 
 pub const Diagnostic = struct {
     message: []const u8 = "",
+    /// A close match for a mistyped option or command, e.g. `--port`.
+    suggestion: ?[]const u8 = null,
     /// The root command name, e.g. `app`.
     program: []const u8 = "",
     /// The command being parsed when parsing stopped, e.g. `app serve`.
@@ -113,6 +114,7 @@ pub fn parseArgs(
 ) Error!T {
     const name = options.name orelse if (argv.len > 0) std.fs.path.basename(argv[0]) else "app";
     diag.program = name;
+    diag.suggestion = null;
     var p: Parser = .{
         .arena = arena,
         .args = if (argv.len > 0) argv[1..] else argv,
@@ -445,7 +447,12 @@ fn parseCommand(
             const e = findLong(table, name) orelse {
                 // After the lookup so an option named `version` wins.
                 if (p.version != null and std.mem.eql(u8, name, "version")) return error.VersionRequested;
-                return p.fail("unknown option '--{s}'", .{name});
+                const flag = arg[0 .. 2 + name.len];
+                p.diag.suggestion = if (p.version != null)
+                    closest(comptime longFlags(table) ++ &[_][]const u8{ "--help", "--version" }, flag)
+                else
+                    closest(comptime longFlags(table) ++ &[_][]const u8{"--help"}, flag);
+                return p.fail("unknown option '{s}'", .{flag});
             };
             try p.apply(e, value);
             continue;
@@ -475,6 +482,7 @@ fn parseCommand(
                     break;
                 }
                 if (@typeInfo(info.field_types[s]) != .optional) {
+                    p.diag.suggestion = closest(comptime commandNames(Unwrap(info.field_types[s])), arg);
                     return p.fail("unknown command '{s}'", .{arg});
                 }
             }
@@ -503,6 +511,60 @@ fn parseCommand(
 fn isNegativeNumber(table: []const Entry, arg: []const u8) bool {
     const c = arg[1];
     return (std.ascii.isDigit(c) or c == '.') and findShort(table, c) == null;
+}
+
+/// The candidate closest to `input` by edit distance, if it is within a
+/// third of the input's length (at least 1). Ties go to the first candidate.
+fn closest(comptime candidates: []const []const u8, input: []const u8) ?[]const u8 {
+    const max_len = comptime blk: {
+        var max: usize = 0;
+        for (candidates) |c| max = @max(max, c.len);
+        break :blk max;
+    };
+    var row: [max_len + 1]usize = undefined;
+    var best: ?[]const u8 = null;
+    var best_distance = @max(1, input.len / 3) + 1;
+    for (candidates) |candidate| {
+        const distance = editDistance(input, candidate, row[0 .. candidate.len + 1]);
+        if (distance < best_distance) {
+            best = candidate;
+            best_distance = distance;
+        }
+    }
+    return best;
+}
+
+/// Levenshtein distance, keeping a single row of `b.len + 1` entries.
+fn editDistance(a: []const u8, b: []const u8, row: []usize) usize {
+    for (row, 0..) |*r, j| r.* = j;
+    for (a, 1..) |ca, i| {
+        var diagonal = row[0];
+        row[0] = i;
+        for (b, 1..) |cb, j| {
+            const above = row[j];
+            const substitute = diagonal + @as(usize, if (ca == cb) 0 else 1);
+            row[j] = @min(above + 1, row[j - 1] + 1, substitute);
+            diagonal = above;
+        }
+    }
+    return row[b.len];
+}
+
+/// Every long name in `table`, with dashes, negations included.
+fn longFlags(comptime table: []const Entry) []const []const u8 {
+    var out: []const []const u8 = &.{};
+    for (table) |e| out = out ++ prefixAll("--", e.longs);
+    return out;
+}
+
+/// The names and aliases of the subcommands in union `U`.
+fn commandNames(comptime U: type) []const []const u8 {
+    const u = @typeInfo(U).@"union";
+    var out: []const []const u8 = &.{};
+    for (u.field_names, u.field_types) |name, Payload| {
+        out = out ++ &[_][]const u8{kebab(name)} ++ configOf(Payload).aliases;
+    }
+    return out;
 }
 
 /// Parses the rest of the arguments as the subcommand named `arg`, or
@@ -1418,6 +1480,38 @@ test "flags named no_*" {
     try testing.expect((try testParse(TestRoot, a, &.{ "serve", "--no-cache" }, null, &diag)).command.serve.no_cache);
     try testing.expect(!(try testParse(TestRoot, a, &.{ "serve", "--no-cache", "--cache" }, null, &diag)).command.serve.no_cache);
     try testing.expectError(error.ParseFailed, testParse(TestRoot, a, &.{ "serve", "--no-no-cache" }, null, &diag));
+}
+
+test "suggestions" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: Diagnostic = .{};
+
+    try testing.expectError(error.ParseFailed, testParse(TestRoot, a, &.{ "serve", "--prot=80" }, null, &diag));
+    try testing.expectEqualStrings("unknown option '--prot'", diag.message);
+    try testing.expectEqualStrings("--port", diag.suggestion.?);
+
+    try testing.expectError(error.ParseFailed, testParse(TestRoot, a, &.{ "serve", "--verbos" }, null, &diag));
+    try testing.expectEqualStrings("--verbose", diag.suggestion.?);
+
+    try testing.expectError(error.ParseFailed, testParse(TestRoot, a, &.{ "serve", "--no-colr" }, null, &diag));
+    try testing.expectEqualStrings("--no-color", diag.suggestion.?);
+
+    try testing.expectError(error.ParseFailed, testParse(TestRoot, a, &.{"--verison"}, null, &diag));
+    try testing.expectEqualStrings("--version", diag.suggestion.?);
+
+    try testing.expectError(error.ParseFailed, testParse(TestRoot, a, &.{"serv"}, null, &diag));
+    try testing.expectEqualStrings("serve", diag.suggestion.?);
+
+    try testing.expectError(error.ParseFailed, testParse(TestRoot, a, &.{"rezise"}, null, &diag));
+    try testing.expectEqualStrings("resize", diag.suggestion.?);
+
+    try testing.expectError(error.ParseFailed, testParse(TestRoot, a, &.{"deploy"}, null, &diag));
+    try testing.expect(diag.suggestion == null);
+
+    try testing.expectError(error.ParseFailed, testParse(TestRoot, a, &.{ "serve", "--zzz" }, null, &diag));
+    try testing.expect(diag.suggestion == null);
 }
 
 fn renderHelp(arena: Allocator, diag: *const Diagnostic) ![]const u8 {
