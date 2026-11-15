@@ -61,7 +61,7 @@ pub fn parse(comptime T: type, init: std.process.Init, options: Options) !T {
                 const color = try clappy.fmt.colorEnabled(init.io, .stdout(), init.environ_map);
                 try diag.writeHelp(w, color);
             } else {
-                try w.print("{s} {s}\n", .{ diag.command, options.version.? });
+                try w.print("{s} {s}\n", .{ diag.program, options.version.? });
             }
             try w.flush();
             std.process.exit(0);
@@ -81,6 +81,8 @@ pub const Error = error{ ParseFailed, HelpRequested, VersionRequested, OutOfMemo
 
 pub const Diagnostic = struct {
     message: []const u8 = "",
+    /// The root command name, e.g. `app`.
+    program: []const u8 = "",
     /// The command being parsed when parsing stopped, e.g. `app serve`.
     command: []const u8 = "",
     /// Set by `Context.warn`, also when parsing succeeds.
@@ -110,6 +112,7 @@ pub fn parseArgs(
     diag: *Diagnostic,
 ) Error!T {
     const name = options.name orelse if (argv.len > 0) std.fs.path.basename(argv[0]) else "app";
+    diag.program = name;
     var p: Parser = .{
         .arena = arena,
         .args = if (argv.len > 0) argv[1..] else argv,
@@ -438,9 +441,12 @@ fn parseCommand(
             const eq = std.mem.indexOfScalar(u8, body, '=');
             const name = body[0 .. eq orelse body.len];
             const value: ?[]const u8 = if (eq) |i| body[i + 1 ..] else null;
-            if (std.mem.eql(u8, name, "help")) return helpRequested(T, inherited, depth, p);
-            if (depth == 0 and p.version != null and std.mem.eql(u8, name, "version")) return error.VersionRequested;
-            const e = findLong(table, name) orelse return p.fail("unknown option '--{s}'", .{name});
+            if (std.mem.eql(u8, name, "help")) return helpRequested(T, inherited, p);
+            const e = findLong(table, name) orelse {
+                // After the lookup so an option named `version` wins.
+                if (p.version != null and std.mem.eql(u8, name, "version")) return error.VersionRequested;
+                return p.fail("unknown option '--{s}'", .{name});
+            };
             try p.apply(e, value);
             continue;
         }
@@ -449,7 +455,7 @@ fn parseCommand(
             while (i < arg.len) : (i += 1) {
                 const c = arg[i];
                 const e = findShort(table, c) orelse {
-                    if (c == 'h') return helpRequested(T, inherited, depth, p);
+                    if (c == 'h') return helpRequested(T, inherited, p);
                     return p.fail("unknown option '-{c}'", .{c});
                 };
                 if (e.kind == .value) {
@@ -646,14 +652,15 @@ fn parseValue(comptime E: type, comptime f: ParseFn(E), raw: []const u8, source:
 
 const HelpFn = *const fn (w: *Writer, color: bool, path: []const u8, show_version: bool) Writer.Error!void;
 
-fn helpRequested(comptime T: type, comptime inherited: []const Entry, comptime depth: usize, p: *Parser) Error {
+fn helpRequested(comptime T: type, comptime inherited: []const Entry, p: *Parser) Error {
+    const table = comptime inherited ++ optionEntries(T, 0);
     p.diag.help = .{
         .render = &struct {
             fn f(w: *Writer, color: bool, path: []const u8, show_version: bool) Writer.Error!void {
                 return writeHelp(T, inherited, w, color, path, show_version);
             }
         }.f,
-        .show_version = depth == 0 and p.version != null,
+        .show_version = p.version != null and comptime findLong(table, "version") == null,
     };
     return error.HelpRequested;
 }
@@ -685,11 +692,13 @@ fn writeHelp(
     if (rest_field != null) try w.writeAll(" [-- args...]");
     try w.writeAll("\n");
 
-    if (positionals.len > 0) {
+    const rest_description = if (rest_field) |r| comptime valueOf(T, r).description else "";
+    if (positionals.len > 0 or rest_description.len > 0) {
         try print(w, color, "\n{%bold}arguments:{%}\n", .{});
         inline for (positionals) |i| {
             try writeRow(w, color, comptime usageName(T, i), comptime valueOf(T, i).description, "");
         }
+        if (rest_description.len > 0) try writeRow(w, color, "-- <args>...", rest_description, "");
     }
 
     if (sub_field) |s| {
@@ -788,15 +797,17 @@ fn optionEntries(comptime T: type, comptime depth: usize) []const Entry {
         const default = info.field_attrs[i].defaultValue(F);
 
         const negated: ?Names = if (kind != .flag) null else switch (value.negate) {
-            .auto => .{ .shorts = "", .longs = prefixAll("no-", longs) },
+            .auto => .{ .shorts = "", .longs = negateLongs(longs) },
             .none => null,
             .names => |n| splitNames(n, name),
         };
+        // `--no-cache` negates to `--cache`, which `--[no-]` can't express.
+        const auto_has_no = value.negate == .auto and kind == .flag and anyHasNoPrefix(longs);
 
         var label: []const u8 = "";
         for (shorts) |c| label = label ++ "-" ++ &[_]u8{c} ++ ", ";
         if (shorts.len == 0) label = "    ";
-        const show_auto = value.negate == .auto and kind == .flag and default != null and default.? == true;
+        const show_auto = value.negate == .auto and kind == .flag and !auto_has_no and default != null and default.? == true;
         label = label ++ join(prefixAll(if (show_auto) "--[no-]" else "--", longs), ", ");
         if (kind == .value) {
             for (0..arity) |_| label = label ++ " " ++ placeholder(Elem(F), kebab(name));
@@ -806,6 +817,7 @@ fn optionEntries(comptime T: type, comptime depth: usize) []const Entry {
         var extra: []const u8 = "";
         if (value.env_vars.len > 0) extra = extra ++ " [env: " ++ join(value.env_vars, ", ") ++ "]";
         if (value.negate == .names) extra = extra ++ " [off: " ++ join(value.negate.names, ", ") ++ "]";
+        if (auto_has_no) extra = extra ++ " [off: " ++ join(prefixAll("--", negated.?.longs), ", ") ++ "]";
         if (kind == .value) extra = extra ++ defaultText(T, i);
 
         entries = entries ++ &[_]Entry{.{
@@ -836,6 +848,21 @@ fn optionEntries(comptime T: type, comptime depth: usize) []const Entry {
         }};
     }
     return entries;
+}
+
+/// `--xyz` turns into `--no-xyz`, and `--no-xyz` into `--xyz`.
+fn negateLongs(comptime longs: []const []const u8) []const []const u8 {
+    var out: []const []const u8 = &.{};
+    for (longs) |long| {
+        const negated = if (std.mem.startsWith(u8, long, "no-")) long[3..] else "no-" ++ long;
+        out = out ++ &[_][]const u8{negated};
+    }
+    return out;
+}
+
+fn anyHasNoPrefix(comptime longs: []const []const u8) bool {
+    for (longs) |long| if (std.mem.startsWith(u8, long, "no-")) return true;
+    return false;
 }
 
 const Names = struct {
@@ -946,8 +973,20 @@ fn validate(comptime T: type, comptime table: []const Entry) void {
         const U = Unwrap(F);
         if (@typeInfo(U) != .@"union" or @typeInfo(U).@"union".tag_type == null)
             @compileError("subcommands field '" ++ info.field_names[i] ++ "' must be a union(enum)" ++ where);
-        for (@typeInfo(U).@"union".field_types) |Payload| {
+        const u = @typeInfo(U).@"union";
+        for (u.field_types) |Payload| {
             if (@typeInfo(Payload) != .@"struct") @compileError("subcommands must be structs" ++ where);
+        }
+        // Each name and alias, paired with the index of the command it belongs to.
+        var claimed_names: []const []const u8 = &.{};
+        var claimed_by: []const usize = &.{};
+        for (u.field_names, u.field_types, 0..) |command, Payload, c| {
+            for (&[_][]const u8{kebab(command)} ++ configOf(Payload).aliases) |name| {
+                for (claimed_names, claimed_by) |other, by| if (std.mem.eql(u8, other, name))
+                    @compileError("'" ++ name ++ "' names both '" ++ u.field_names[by] ++ "' and '" ++ command ++ "'" ++ where);
+                claimed_names = claimed_names ++ &[_][]const u8{name};
+                claimed_by = claimed_by ++ &[_]usize{c};
+            }
         }
         if (@typeInfo(F) != .optional and fieldsOfKind(T, .positional).len > 0)
             @compileError("positionals next to a required subcommand are ambiguous, make the subcommand optional" ++ where);
@@ -1007,11 +1046,14 @@ fn placeholder(comptime E: type, comptime name: []const u8) []const u8 {
 fn defaultText(comptime T: type, comptime i: usize) []const u8 {
     const info = @typeInfo(T).@"struct";
     const F = info.field_types[i];
-    const default = info.field_attrs[i].defaultValue(F) orelse return "";
-    return switch (@typeInfo(F)) {
+    const U = Unwrap(F);
+    const field_default = info.field_attrs[i].defaultValue(F) orelse return "";
+    // `?u16 = 5` shows 5, `?u16 = null` shows nothing.
+    const default: U = if (@typeInfo(F) == .optional) field_default orelse return "" else field_default;
+    return switch (@typeInfo(U)) {
         .int, .float => std.fmt.comptimePrint(" [default: {d}]", .{default}),
         .@"enum" => " [default: " ++ @tagName(default) ++ "]",
-        .pointer => if (F == []const u8) " [default: \"" ++ default ++ "\"]" else "",
+        .pointer => if (U == []const u8) " [default: \"" ++ default ++ "\"]" else "",
         .array => |a| if (@typeInfo(a.child) == .int) std.fmt.comptimePrint(" [default: {any}]", .{default}) else "",
         else => "",
     };
@@ -1102,6 +1144,8 @@ const TestRoot = struct {
         level: enum { debug, info } = .info,
         tags: []const []const u8 = &.{},
         dry_run: bool = false,
+        no_cache: bool = false,
+        timeout: ?u32 = 30,
 
         fn parsePort(raw: []const u8, ctx: *Context) ParseError!u16 {
             const port = try Parse.int(u16)(raw, ctx);
@@ -1127,7 +1171,7 @@ const TestRoot = struct {
         pub const clappy_config: Config(@This()) = .{
             .values = .{
                 .script = .positional(.{}),
-                .args = .rest(.{}),
+                .args = .rest(.{ .description = "Passed to the script" }),
             },
         };
 
@@ -1327,17 +1371,57 @@ test "help and version" {
     var diag: Diagnostic = .{};
 
     try testing.expectError(error.VersionRequested, testParse(TestRoot, a, &.{"--version"}, null, &diag));
-    try testing.expectEqualStrings("app", diag.command);
+    try testing.expectEqualStrings("app", diag.program);
+    try testing.expectError(error.VersionRequested, testParse(TestRoot, a, &.{ "serve", "--version" }, null, &diag));
+    try testing.expectEqualStrings("app", diag.program);
 
     try testing.expectError(error.HelpRequested, testParse(TestRoot, a, &.{ "resize", "-h" }, null, &diag));
-    var out: Writer.Allocating = .init(a);
-    try diag.writeHelp(&out.writer, false);
-    const help = out.written();
+    const help = try renderHelp(a, &diag);
     try testing.expect(std.mem.indexOf(u8, help, "usage: app resize [options] <size> <size>") != null);
     try testing.expect(std.mem.indexOf(u8, help, "--[no-]keep-ratio") != null);
     try testing.expect(std.mem.indexOf(u8, help, "-f, --fast") != null);
     try testing.expect(std.mem.indexOf(u8, help, "[off: -S, --slow]") != null);
     try testing.expect(std.mem.indexOf(u8, help, "--scale <scale> <scale>") != null);
     try testing.expect(std.mem.indexOf(u8, help, "global options:") != null);
-    try testing.expect(std.mem.indexOf(u8, help, "--version") == null);
+    try testing.expect(std.mem.indexOf(u8, help, "--version") != null);
+
+    try testing.expectError(error.HelpRequested, testParse(TestRoot, a, &.{ "run", "-h" }, null, &diag));
+    const run_help = try renderHelp(a, &diag);
+    try testing.expect(std.mem.indexOf(u8, run_help, "-- <args>...") != null);
+    try testing.expect(std.mem.indexOf(u8, run_help, "Passed to the script") != null);
+
+    try testing.expectError(error.HelpRequested, testParse(TestRoot, a, &.{ "serve", "-h" }, null, &diag));
+    const serve_help = try renderHelp(a, &diag);
+    try testing.expect(std.mem.indexOf(u8, serve_help, "[default: 30]") != null);
+    try testing.expect(std.mem.indexOf(u8, serve_help, "    --no-cache ") != null);
+    try testing.expect(std.mem.indexOf(u8, serve_help, "[off: --cache]") != null);
+}
+
+test "version option defined by the command wins" {
+    const Cmd = struct {
+        version: ?u8 = null,
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var diag: Diagnostic = .{};
+
+    const args = try testParse(Cmd, arena.allocator(), &.{ "--version", "3" }, null, &diag);
+    try testing.expectEqual(3, args.version);
+}
+
+test "flags named no_*" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: Diagnostic = .{};
+
+    try testing.expect((try testParse(TestRoot, a, &.{ "serve", "--no-cache" }, null, &diag)).command.serve.no_cache);
+    try testing.expect(!(try testParse(TestRoot, a, &.{ "serve", "--no-cache", "--cache" }, null, &diag)).command.serve.no_cache);
+    try testing.expectError(error.ParseFailed, testParse(TestRoot, a, &.{ "serve", "--no-no-cache" }, null, &diag));
+}
+
+fn renderHelp(arena: Allocator, diag: *const Diagnostic) ![]const u8 {
+    var out: Writer.Allocating = .init(arena);
+    try diag.writeHelp(&out.writer, false);
+    return out.written();
 }

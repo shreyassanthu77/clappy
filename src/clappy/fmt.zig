@@ -83,7 +83,9 @@ fn escapeBraces(comptime s: []const u8) []const u8 {
 pub fn stdout(comptime fmt: []const u8, args: anytype) Writer.Error!void {
     const target = stdout_target orelse @panic("clappy.fmt.init must be called before clappy.fmt.stdout");
     var buffer: [256]u8 = undefined;
-    var w = Io.File.stdout().writer(target.io, &buffer);
+    // Streaming: a positional writer starts at offset 0 every call and
+    // would overwrite earlier output when stdout is a regular file.
+    var w = Io.File.stdout().writerStreaming(target.io, &buffer);
     try print(&w.interface, target.color, fmt, args);
     try w.interface.flush();
 }
