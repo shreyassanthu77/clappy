@@ -67,6 +67,14 @@ pub fn parse(comptime T: type, init: std.process.Init, options: Options) !T {
             std.process.exit(0);
         },
         error.ParseFailed => {
+            if (diag.show_help) {
+                var buffer: [1024]u8 = undefined;
+                const t = std.debug.lockStderr(&buffer).terminal();
+                defer std.debug.unlockStderr();
+                try diag.writeHelp(t.writer, t.mode == .escape_codes);
+                try t.writer.flush();
+                std.process.exit(2);
+            }
             try clappy.fmt.stderr("{%red,bold}error:{%} {s}\n", .{diag.message});
             if (diag.suggestion) |s| try clappy.fmt.stderr("did you mean {%green}{s}{%}?\n", .{s});
             try clappy.fmt.stderr("{%dim}run '{s} --help' for usage{%}\n", .{diag.command});
@@ -89,13 +97,17 @@ pub const Diagnostic = struct {
     /// Set by `Context.warn`, also when parsing succeeds.
     warnings: std.ArrayList([]const u8) = .empty,
     help: ?Help = null,
+    /// The failure is better explained by the command's help than by
+    /// `message`, e.g. a bare `app` whose subcommand is required.
+    show_help: bool = false,
 
     const Help = struct {
         render: HelpFn,
         show_version: bool,
     };
 
-    /// Writes the help requested with `--help` or `-h`.
+    /// Writes the help of `command`, requested with `--help` or `-h`, or
+    /// shown because of `show_help`.
     pub fn writeHelp(diag: *const Diagnostic, w: *Writer, color: bool) Writer.Error!void {
         const help = diag.help orelse return;
         try help.render(w, color, diag.command, help.show_version);
@@ -112,9 +124,11 @@ pub fn parseArgs(
     options: Options,
     diag: *Diagnostic,
 ) Error!T {
-    const name = options.name orelse if (argv.len > 0) std.fs.path.basename(argv[0]) else "app";
+    const name = programName(argv, options);
     diag.program = name;
     diag.suggestion = null;
+    diag.help = null;
+    diag.show_help = false;
     var p: Parser = .{
         .arena = arena,
         .args = if (argv.len > 0) argv[1..] else argv,
@@ -123,6 +137,28 @@ pub fn parseArgs(
         .diag = diag,
     };
     return parseCommand(T, &.{}, 0, &p, name);
+}
+
+/// Prints the help of the root command `T` to stdout, as `--help` would.
+/// Useful when an optional subcommand is missing.
+pub fn printHelp(comptime T: type, init: std.process.Init, options: Options) !void {
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    var buffer: [1024]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &buffer);
+    const color = try clappy.fmt.colorEnabled(init.io, .stdout(), init.environ_map);
+    try writeHelp(T, &stdout.interface, color, programName(argv, options), options.version);
+    try stdout.interface.flush();
+}
+
+/// Writes the help of the root command `T`. `--version` is listed when
+/// `version` is set, matching `Options.version`.
+pub fn writeHelp(comptime T: type, w: *Writer, color: bool, name: []const u8, version: ?[]const u8) Writer.Error!void {
+    const show_version = version != null and comptime findLong(optionEntries(T, 0), "version") == null;
+    try writeCommandHelp(T, &.{}, w, color, name, show_version);
+}
+
+fn programName(argv: []const [:0]const u8, options: Options) []const u8 {
+    return options.name orelse if (argv.len > 0) std.fs.path.basename(argv[0]) else "app";
 }
 
 /// The type of a command's `pub const clappy_config` decl.
@@ -421,6 +457,7 @@ fn parseCommand(
     defer _ = p.levels.pop();
     p.diag.command = path;
 
+    const start = p.index;
     var bare: std.ArrayList([]const u8) = .empty;
     var sub: ?Unwrap(if (sub_field) |s| info.field_types[s] else void) = null;
     var after_dash_dash = false;
@@ -481,7 +518,9 @@ fn parseCommand(
                     sub = value;
                     break;
                 }
-                if (@typeInfo(info.field_types[s]) != .optional) {
+                // With no positionals to take it, a bare argument can only
+                // have been meant as a command, even an optional one.
+                if (@typeInfo(info.field_types[s]) != .optional or comptime fieldsOfKind(T, .positional).len == 0) {
                     p.diag.suggestion = closest(comptime commandNames(Unwrap(info.field_types[s])), arg);
                     return p.fail("unknown command '{s}'", .{arg});
                 }
@@ -499,7 +538,7 @@ fn parseCommand(
             @field(out, name) = if (@typeInfo(F) == .optional)
                 sub
             else
-                sub orelse return p.fail("missing command", .{});
+                sub orelse return missingCommand(T, inherited, p, start);
         } else {
             @field(out, name) = try finalize(T, i, &slots[i], p);
         }
@@ -715,19 +754,33 @@ fn parseValue(comptime E: type, comptime f: ParseFn(E), raw: []const u8, source:
 const HelpFn = *const fn (w: *Writer, color: bool, path: []const u8, show_version: bool) Writer.Error!void;
 
 fn helpRequested(comptime T: type, comptime inherited: []const Entry, p: *Parser) Error {
+    setHelp(T, inherited, p);
+    return error.HelpRequested;
+}
+
+/// A required subcommand is missing. With no arguments at all for this
+/// command, its help says more than an error would.
+fn missingCommand(comptime T: type, comptime inherited: []const Entry, p: *Parser, start: usize) Error {
+    if (p.index == start) {
+        setHelp(T, inherited, p);
+        p.diag.show_help = true;
+    }
+    return p.fail("missing command", .{});
+}
+
+fn setHelp(comptime T: type, comptime inherited: []const Entry, p: *Parser) void {
     const table = comptime inherited ++ optionEntries(T, 0);
     p.diag.help = .{
         .render = &struct {
             fn f(w: *Writer, color: bool, path: []const u8, show_version: bool) Writer.Error!void {
-                return writeHelp(T, inherited, w, color, path, show_version);
+                return writeCommandHelp(T, inherited, w, color, path, show_version);
             }
         }.f,
         .show_version = p.version != null and comptime findLong(table, "version") == null,
     };
-    return error.HelpRequested;
 }
 
-fn writeHelp(
+fn writeCommandHelp(
     comptime T: type,
     comptime inherited: []const Entry,
     w: *Writer,
@@ -1405,6 +1458,12 @@ test "errors" {
 
     try testing.expectError(error.ParseFailed, testParse(TestRoot, a, &.{}, null, &diag));
     try testing.expectEqualStrings("missing command", diag.message);
+    try testing.expect(diag.show_help);
+    try testing.expect(std.mem.indexOf(u8, try renderHelp(a, &diag), "usage: app [options] <command>") != null);
+
+    try testing.expectError(error.ParseFailed, testParse(TestRoot, a, &.{"-v"}, null, &diag));
+    try testing.expectEqualStrings("missing command", diag.message);
+    try testing.expect(!diag.show_help);
 
     try testing.expectError(error.ParseFailed, testParse(TestRoot, a, &.{"deploy"}, null, &diag));
     try testing.expectEqualStrings("unknown command 'deploy'", diag.message);
@@ -1512,6 +1571,37 @@ test "suggestions" {
 
     try testing.expectError(error.ParseFailed, testParse(TestRoot, a, &.{ "serve", "--zzz" }, null, &diag));
     try testing.expect(diag.suggestion == null);
+}
+
+test "optional subcommand" {
+    const Cmd = struct {
+        verbose: bool = false,
+        command: ?union(enum) { serve: TestRoot.Serve, run: TestRoot.Run },
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: Diagnostic = .{};
+
+    try testing.expect((try testParse(Cmd, a, &.{}, null, &diag)).command == null);
+    try testing.expect((try testParse(Cmd, a, &.{"--verbose"}, null, &diag)).command == null);
+
+    try testing.expectError(error.ParseFailed, testParse(Cmd, a, &.{"serv"}, null, &diag));
+    try testing.expectEqualStrings("unknown command 'serv'", diag.message);
+    try testing.expectEqualStrings("serve", diag.suggestion.?);
+    try testing.expect(!diag.show_help);
+}
+
+test writeHelp {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var out: Writer.Allocating = .init(arena.allocator());
+
+    try writeHelp(TestRoot, &out.writer, false, "app", "1.2.3");
+    const help = out.written();
+    try testing.expect(std.mem.indexOf(u8, help, "usage: app [options] <command>") != null);
+    try testing.expect(std.mem.indexOf(u8, help, "serve (s)") != null);
+    try testing.expect(std.mem.indexOf(u8, help, "--version") != null);
 }
 
 fn renderHelp(arena: Allocator, diag: *const Diagnostic) ![]const u8 {
