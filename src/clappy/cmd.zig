@@ -629,6 +629,7 @@ fn editDistance(a: []const u8, b: []const u8, row: []usize) usize {
 
 /// Every long name in `table`, with dashes, negations included.
 fn longFlags(comptime table: []const Entry) []const []const u8 {
+    raiseQuota(table.len);
     var out: []const []const u8 = &.{};
     for (table) |e| out = out ++ prefixAll("--", e.longs);
     return out;
@@ -636,6 +637,7 @@ fn longFlags(comptime table: []const Entry) []const []const u8 {
 
 /// The names and aliases of the subcommands in union `U`.
 fn commandNames(comptime U: type) []const []const u8 {
+    raiseQuota(@typeInfo(U).@"union".field_names.len);
     const u = @typeInfo(U).@"union";
     var out: []const []const u8 = &.{};
     for (u.field_names, u.field_types) |name, Payload| {
@@ -935,6 +937,7 @@ fn findShort(table: []const Entry, c: u8) ?Entry {
 }
 
 fn optionEntries(comptime T: type, comptime depth: usize) []const Entry {
+    raiseQuota(@typeInfo(T).@"struct".field_names.len);
     const info = @typeInfo(T).@"struct";
     var entries: []const Entry = &.{};
     for (info.field_names, info.field_types, 0..) |name, F, i| {
@@ -1047,6 +1050,7 @@ fn globalEntries(comptime entries: []const Entry) []const Entry {
 }
 
 fn fieldsOfKind(comptime T: type, comptime kind: Kind) []const usize {
+    raiseQuota(@typeInfo(T).@"struct".field_names.len);
     var fields: []const usize = &.{};
     for (0..@typeInfo(T).@"struct".field_names.len) |i| {
         if (valueOf(T, i).kind == kind) fields = fields ++ &[_]usize{i};
@@ -1061,6 +1065,7 @@ fn firstFieldOfKind(comptime T: type, comptime kind: Kind) ?usize {
 
 /// Compile errors for configurations the parser can't handle unambiguously.
 fn validate(comptime T: type, comptime table: []const Entry) void {
+    raiseQuota(@typeInfo(T).@"struct".field_names.len + table.len);
     const info = @typeInfo(T).@"struct";
     const where = " in " ++ @typeName(T);
 
@@ -1147,6 +1152,14 @@ fn validate(comptime T: type, comptime table: []const Entry) void {
     }
 }
 
+/// Comptime work over a command grows with its fields and options, roughly
+/// quadratically where names are compared pairwise, and passes the default
+/// quota of 1000 by about the tenth option. The quota is per evaluation, so
+/// raising it here covers the caller too.
+fn raiseQuota(comptime n: usize) void {
+    @setEvalBranchQuota(10_000 + 1_000 * n * n);
+}
+
 fn configOf(comptime T: type) Config(T) {
     return if (@hasDecl(T, "clappy_config")) T.clappy_config else .{};
 }
@@ -1162,6 +1175,7 @@ fn valueOf(comptime T: type, comptime i: usize) Value(@typeInfo(T).@"struct".fie
 }
 
 fn displayName(comptime T: type, comptime i: usize) []const u8 {
+    raiseQuota(@typeInfo(T).@"struct".field_names.len);
     const value = valueOf(T, i);
     return switch (value.kind) {
         .positional => usageName(T, i),
@@ -1430,6 +1444,35 @@ test "rest args without --" {
     try testing.expect(exec.quiet);
     try testing.expectEqual(2, exec.cmd.len);
     try testing.expectEqualStrings("ls", exec.cmd[0]);
+}
+
+test "many options stay within the branch quota" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: Diagnostic = .{};
+
+    const n = 40;
+    const Many = comptime blk: {
+        var names: [n][]const u8 = undefined;
+        var types: [n]type = undefined;
+        var attrs: [n]std.builtin.Type.Struct.FieldAttributes = undefined;
+        for (&names, &types, &attrs, 0..) |*name, *ty, *attr, i| {
+            name.* = std.fmt.comptimePrint("a_rather_long_option_name_{d}", .{i});
+            ty.* = bool;
+            attr.* = .{ .default_value_ptr = &false };
+        }
+        break :blk @Struct(.auto, null, &names, &types, &attrs);
+    };
+
+    const args = try testParse(Many, a, &.{"--a-rather-long-option-name-39"}, null, &diag);
+    try testing.expect(args.a_rather_long_option_name_39);
+
+    try testing.expectError(error.ParseFailed, testParse(Many, a, &.{"--a-rather-long-option-nam-39"}, null, &diag));
+    try testing.expectEqualStrings("--a-rather-long-option-name-39", diag.suggestion.?);
+
+    try testing.expectError(error.HelpRequested, testParse(Many, a, &.{"-h"}, null, &diag));
+    _ = try renderHelp(a, &diag);
 }
 
 test "rest args that require --" {
