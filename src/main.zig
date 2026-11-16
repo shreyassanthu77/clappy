@@ -88,7 +88,7 @@ const Copy = struct {
 
 const Run = struct {
     pub const clappy_config: clappy.cmd.Config(@This()) = .{
-        .description = "Run a script, passing everything after -- to it",
+        .description = "Run a script, passing everything after it through",
         .values = .{
             .script = .positional(.{ .description = "Script to run" }),
             .args = .rest(.{ .description = "Arguments for the script" }),

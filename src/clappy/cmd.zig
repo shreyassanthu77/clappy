@@ -205,6 +205,7 @@ pub fn Value(comptime F: type) type {
         delimiter: ?u8 = null,
         global: bool = false,
         negate: Negate = .auto,
+        require_dash_dash: bool = false,
 
         const Self = @This();
 
@@ -278,11 +279,17 @@ pub fn Value(comptime F: type) type {
 
         pub const Rest = struct {
             description: []const u8 = "",
+            /// Only start after `--`, so options after the last positional
+            /// are still parsed, like `cargo run -- args`.
+            require_dash_dash: bool = false,
         };
 
-        /// Everything after `--`, untouched. The field must be `[]const []const u8`.
+        /// Everything after the last positional (or the first bare argument
+        /// when there are none), untouched, options included. A `--` there is
+        /// skipped. Next to a list positional only `--` starts it. The field
+        /// must be `[]const []const u8`.
         pub fn rest(o: Rest) Self {
-            return .{ .kind = .rest, .description = o.description };
+            return .{ .kind = .rest, .description = o.description, .require_dash_dash = o.require_dash_dash };
         }
 
         /// The field must be a `union(enum)` (or an optional one) of command
@@ -448,6 +455,7 @@ fn parseCommand(
     const table = comptime inherited ++ own;
     const globals = comptime inherited ++ globalEntries(own);
     const rest_field = comptime firstFieldOfKind(T, .rest);
+    const rest_start = comptime restStart(T);
     const sub_field = comptime firstFieldOfKind(T, .subcommands);
     comptime validate(T, table);
 
@@ -461,8 +469,13 @@ fn parseCommand(
     var bare: std.ArrayList([]const u8) = .empty;
     var sub: ?Unwrap(if (sub_field) |s| info.field_types[s] else void) = null;
     var after_dash_dash = false;
+    var in_rest = false;
 
     while (p.next()) |arg| {
+        if (in_rest) {
+            try slots[rest_field.?].raws.append(p.arena, arg);
+            continue;
+        }
         if (after_dash_dash) {
             if (rest_field) |r| {
                 try slots[r].raws.append(p.arena, arg);
@@ -475,6 +488,13 @@ fn parseCommand(
             after_dash_dash = true;
             continue;
         }
+        // Once the last positional is filled, everything after it, options
+        // included, belongs to the rest field.
+        if (rest_start) |n| if (n > 0 and bare.items.len == n) {
+            in_rest = true;
+            try slots[rest_field.?].raws.append(p.arena, arg);
+            continue;
+        };
         if (std.mem.startsWith(u8, arg, "--")) {
             const body = arg[2..];
             const eq = std.mem.indexOfScalar(u8, body, '=');
@@ -518,13 +538,20 @@ fn parseCommand(
                     sub = value;
                     break;
                 }
-                // With no positionals to take it, a bare argument can only
-                // have been meant as a command, even an optional one.
-                if (@typeInfo(info.field_types[s]) != .optional or comptime fieldsOfKind(T, .positional).len == 0) {
+                // With no positionals or rest to take it, a bare argument can
+                // only have been meant as a command, even an optional one.
+                const takes_bare = comptime fieldsOfKind(T, .positional).len > 0 or rest_start != null;
+                if (@typeInfo(info.field_types[s]) != .optional or !takes_bare) {
                     p.diag.suggestion = closest(comptime commandNames(Unwrap(info.field_types[s])), arg);
                     return p.fail("unknown command '{s}'", .{arg});
                 }
             }
+        }
+        // Without positionals, the first bare argument starts the rest.
+        if (rest_start == 0) {
+            in_rest = true;
+            try slots[rest_field.?].raws.append(p.arena, arg);
+            continue;
         }
         try bare.append(p.arena, arg);
     }
@@ -544,6 +571,17 @@ fn parseCommand(
         }
     }
     return out;
+}
+
+/// How many bare arguments come before the rest field picks up the others
+/// without a `--`. Null when there is no rest field, it requires `--`, or a
+/// list positional would take them all.
+fn restStart(comptime T: type) ?usize {
+    const r = firstFieldOfKind(T, .rest) orelse return null;
+    if (valueOf(T, r).require_dash_dash) return null;
+    var sum: usize = 0;
+    for (fieldsOfKind(T, .positional)) |i| sum += positionalWidth(@typeInfo(T).@"struct".field_types[i]) orelse return null;
+    return sum;
 }
 
 /// `-5` and `-.5` are values unless a short option uses that character.
@@ -804,7 +842,7 @@ fn writeCommandHelp(
     if (sub_field) |s| {
         try w.writeAll(if (@typeInfo(info.field_types[s]) == .optional) " [command]" else " <command>");
     }
-    if (rest_field != null) try w.writeAll(" [-- args...]");
+    if (rest_field != null) try w.writeAll(if (comptime restStart(T) != null) " [args...]" else " [-- args...]");
     try w.writeAll("\n");
 
     const rest_description = if (rest_field) |r| comptime valueOf(T, r).description else "";
@@ -813,7 +851,8 @@ fn writeCommandHelp(
         inline for (positionals) |i| {
             try writeRow(w, color, comptime usageName(T, i), comptime valueOf(T, i).description, "");
         }
-        if (rest_description.len > 0) try writeRow(w, color, "-- <args>...", rest_description, "");
+        const rest_label = if (comptime restStart(T) != null) "<args>..." else "-- <args>...";
+        if (rest_description.len > 0) try writeRow(w, color, rest_label, rest_description, "");
     }
 
     if (sub_field) |s| {
@@ -1368,6 +1407,59 @@ test "rest args" {
     try testing.expectEqual(0, args.verbose);
 }
 
+test "rest args without --" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: Diagnostic = .{};
+
+    const args = try testParse(TestRoot, a, &.{ "run", "-v", "build.sh", "--release", "-v", "--", "x" }, null, &diag);
+    const run = args.command.run;
+    try testing.expectEqualStrings("build.sh", run.script);
+    try testing.expectEqual(4, run.args.len);
+    try testing.expectEqualStrings("--release", run.args[0]);
+    try testing.expectEqualStrings("--", run.args[2]);
+    try testing.expectEqual(1, args.verbose);
+
+    const Exec = struct {
+        pub const clappy_config: Config(@This()) = .{ .values = .{ .cmd = .rest(.{}) } };
+        quiet: bool = false,
+        cmd: []const []const u8,
+    };
+    const exec = try testParse(Exec, a, &.{ "--quiet", "ls", "--quiet" }, null, &diag);
+    try testing.expect(exec.quiet);
+    try testing.expectEqual(2, exec.cmd.len);
+    try testing.expectEqualStrings("ls", exec.cmd[0]);
+}
+
+test "rest args that require --" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: Diagnostic = .{};
+
+    const Cargo = struct {
+        pub const clappy_config: Config(@This()) = .{ .values = .{
+            .bin = .positional(.{}),
+            .args = .rest(.{ .description = "Passed to the binary", .require_dash_dash = true }),
+        } };
+        release: bool = false,
+        bin: []const u8,
+        args: []const []const u8,
+    };
+    const args = try testParse(Cargo, a, &.{ "app", "--release", "--", "--release" }, null, &diag);
+    try testing.expect(args.release);
+    try testing.expectEqual(1, args.args.len);
+
+    try testing.expectError(error.ParseFailed, testParse(Cargo, a, &.{ "app", "extra" }, null, &diag));
+    try testing.expectEqualStrings("unexpected argument 'extra'", diag.message);
+
+    try testing.expectError(error.HelpRequested, testParse(Cargo, a, &.{"-h"}, null, &diag));
+    const help = try renderHelp(a, &diag);
+    try testing.expect(std.mem.indexOf(u8, help, "<bin> [-- args...]") != null);
+    try testing.expect(std.mem.indexOf(u8, help, "-- <args>...") != null);
+}
+
 test "arrays, negative numbers and negated flags" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -1508,7 +1600,7 @@ test "help and version" {
 
     try testing.expectError(error.HelpRequested, testParse(TestRoot, a, &.{ "run", "-h" }, null, &diag));
     const run_help = try renderHelp(a, &diag);
-    try testing.expect(std.mem.indexOf(u8, run_help, "-- <args>...") != null);
+    try testing.expect(std.mem.indexOf(u8, run_help, "<script> [args...]") != null);
     try testing.expect(std.mem.indexOf(u8, run_help, "Passed to the script") != null);
 
     try testing.expectError(error.HelpRequested, testParse(TestRoot, a, &.{ "serve", "-h" }, null, &diag));

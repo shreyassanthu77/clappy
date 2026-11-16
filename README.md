@@ -95,7 +95,7 @@ Each field gets its value from a `.values` entry in `clappy_config`:
 | `.positional(.{...})` | `app input.txt`                           | Bare arguments, in field declaration order  |
 | `.count(.{...})`      | `-vvv`                                    | How often a flag was given (integer field)  |
 | `.env(.{...})`        | `API_TOKEN=... app`                       | Only read from the environment              |
-| `.rest(.{...})`       | `app run script -- --raw args`            | Everything after `--` (`[]const []const u8`) |
+| `.rest(.{...})`       | `app run script --raw args`               | Everything after the last positional, untouched (`[]const []const u8`); `.require_dash_dash = true` only takes what follows `--` |
 | `.subcommands`        | `app serve`                               | A `union(enum)` of command structs          |
 
 Fields left out of `.values` become options named after the field
@@ -236,7 +236,7 @@ $ pkg -v a foo bar -D
 adding foo
 adding bar
 
-$ pkg run build -- --release
+$ pkg run build --release
 running build with 1 args
 
 $ pkg add --help
